@@ -7,20 +7,167 @@ são independentes do desenvolvimento e da produção.
 
 ## Preparar a máquina
 
-Use uma VM Ubuntu Server 24.04 LTS no Windows, com pelo menos 2 vCPU,
-4 GB de RAM e 30 GB de disco como ponto de partida. A rede deve permitir acesso
-do Windows à VM: use modo bridge/comutador externo e reserve um IP no roteador.
-Não encaminhe portas do roteador para essa VM. Esses recursos não garantem
-capacidade de produção; ajuste conforme consumo e carga.
+Use uma VM Ubuntu Server 24.04 LTS no Windows com a mesma capacidade do plano
+Hostinger KVM 1 usado como referência: 1 vCPU, 4 GB de RAM fixa e disco virtual
+de 50 GB. A VM não reproduz a franquia de 4 TB nem garante o mesmo desempenho da
+VPS; ela serve para validar a instalação, os containers e o comportamento de
+produção. A rede deve permitir acesso do Windows à VM. O Hyper-V Default Switch
+é suficiente para a primeira instalação; para um IP LAN estável, use um
+comutador externo e reserve o endereço no roteador. Não encaminhe portas do
+roteador para essa VM.
 
-Dentro da VM, instale Git, OpenSSL e Docker Engine com o plugin Compose seguindo
-a [documentação oficial para Ubuntu](https://docs.docker.com/engine/install/ubuntu/).
-Docker Desktop não é necessário dentro do Linux. Verifique:
+### Criar a VM no Hyper-V
+
+No PowerShell como administrador, habilite o Hyper-V, reinicie o Windows e crie
+uma VM de geração 2 com memória não dinâmica:
+
+~~~powershell
+Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart
+# reinicie o Windows antes de continuar
+
+$vmName = "EasySlotting-Staging"
+$vmPath = "C:\VMs\EasySlotting-Staging"
+New-Item -ItemType Directory -Path $vmPath -Force | Out-Null
+New-VM -Name $vmName -Generation 2 -MemoryStartupBytes 4GB `
+  -NewVHDPath "$vmPath\disco.vhdx" -NewVHDSizeBytes 50GB `
+  -Path $vmPath -SwitchName "Default Switch"
+Set-VMProcessor -VMName $vmName -Count 1
+Set-VMMemory -VMName $vmName -DynamicMemoryEnabled $false
+Set-VMFirmware -VMName $vmName -EnableSecureBoot On `
+  -SecureBootTemplate MicrosoftUEFICertificateAuthority
+~~~
+
+Conecte o ISO `ubuntu-24.04.x-live-server-amd64.iso` ao DVD virtual, inicie a
+VM e escolha Ubuntu Server sem drivers de terceiros. Use o particionamento
+automático do disco virtual de 50 GB.
+
+### Abrir e controlar a VM no Windows
+
+Os arquivos da VM ficam fora do repositório, em `C:\VMs\EasySlotting-Staging`.
+O disco virtual é `disco.vhdx`; não o mova nem o abra diretamente enquanto a VM
+estiver ligada. Não é necessário criar uma pasta ou executável na área de
+trabalho. Use o PowerShell como administrador:
+
+~~~powershell
+# Iniciar a VM e abrir o console
+Start-VM -Name "EasySlotting-Staging"
+vmconnect.exe localhost "EasySlotting-Staging"
+
+# Abrir o console se a VM já estiver ligada
+vmconnect.exe localhost "EasySlotting-Staging"
+
+# Conferir estado e endereço do console Hyper-V
+Get-VM -Name "EasySlotting-Staging" | Select-Object Name, State, Status
+
+# Desligamento normal solicitado pelo sistema convidado
+Stop-VM -Name "EasySlotting-Staging"
+
+# Desligamento forçado somente se a VM estiver travada
+Stop-VM -Name "EasySlotting-Staging" -TurnOff
+~~~
+
+Para verificar a configuração equivalente ao KVM 1:
+
+~~~powershell
+Get-VM -Name "EasySlotting-Staging" |
+  Select-Object Name, State, ProcessorCount, MemoryStartup
+Get-VHD -Path "C:\VMs\EasySlotting-Staging\disco.vhdx" |
+  Select-Object Path, Size, FileSize
+~~~
+
+O `vmconnect.exe` é instalado com o Hyper-V e normalmente fica em
+`C:\Windows\System32\vmconnect.exe`. O console abre um terminal Ubuntu sem
+interface gráfica; entre com o usuário `deploy`. Para acessar por SSH depois,
+use o IPv4 mostrado por `hostname -I` dentro da VM:
+
+~~~powershell
+ssh deploy@IP_DA_VM
+~~~
+
+O `Default Switch` do Hyper-V pode trocar o IP após reiniciar. Use o IP atual
+para o SSH e para o navegador, ou configure um comutador externo se precisar de
+um endereço LAN estável.
+
+### Problema de rede no instalador Hyper-V
+
+Em algumas redes, o instalador fica repetindo **Ubuntu archive mirror
+configuration** ou expira durante o download. Nesta VM, o DNS funcionou e o
+HTTP para `archive.ubuntu.com` respondeu, mas o download com MTU 1500 expirou.
+O download passou ao reduzir temporariamente a MTU da interface para 1400:
 
 ~~~bash
-sudo docker version
-sudo docker compose version
+ip link show eth0
+ip link set dev eth0 mtu 1400
+curl -4 -m 30 -o /dev/null \
+  http://archive.ubuntu.com/ubuntu/dists/noble-updates/InRelease
 ~~~
+
+O resultado esperado é `100` por cento recebido. Volte ao instalador com
+`exit` e use o espelho oficial `http://archive.ubuntu.com/ubuntu/`; avance
+somente quando a tela informar **This mirror location passed tests**.
+
+Esse ajuste feito no shell do instalador é temporário e desaparece ao reiniciar.
+Depois do primeiro boot, teste novamente `apt update`. Se o problema retornar,
+torne a MTU persistente no Netplan, ajustando o nome da interface:
+
+~~~yaml
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      mtu: 1400
+~~~
+
+Salve em `/etc/netplan/99-easyslotting-mtu.yaml`, aplique com
+`sudo netplan try` e confirme com `sudo netplan apply`. Se a rede funcionar
+com MTU 1500 após a instalação, não mantenha 1400 sem necessidade. O problema
+é específico do caminho de rede local/Hyper-V e não deve ser copiado para a VPS
+sem teste.
+
+Dentro da VM, atualize o Ubuntu e instale somente as ferramentas do host. Não
+instale Ruby, Node ou PostgreSQL diretamente: essas dependências serão instaladas
+nas imagens Docker da aplicação.
+
+~~~bash
+sudo apt update
+sudo apt upgrade -y
+sudo apt install -y git ca-certificates curl openssh-server
+sudo apt install -y docker.io docker-compose-v2
+sudo systemctl enable --now docker
+sudo usermod -aG docker deploy
+~~~
+
+Saia e entre novamente no usuário `deploy` para que o grupo Docker seja aplicado.
+Confira:
+
+~~~bash
+git --version
+docker version
+docker compose version
+~~~
+
+Docker Desktop não é necessário dentro do Linux. Se a instalação do Docker vier
+de outra fonte, siga a [documentação oficial para Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+e mantenha apenas uma instalação ativa.
+
+Se a senha de `deploy` for esquecida, inicialize temporariamente pelo ISO do
+Ubuntu, abra **Help > Enter shell**, identifique o volume com `lsblk -f` e monte
+o volume lógico instalado. No layout criado pelo instalador, o comando é:
+
+~~~bash
+mkdir -p /target
+mount /dev/mapper/ubuntu--vg-ubuntu--lv /target
+chroot /target /bin/bash
+passwd deploy
+exit
+umount /target
+exit
+~~~
+
+Desconecte o ISO antes de reiniciar a VM para que ela volte a iniciar pelo disco
+virtual. A senha não deve ser armazenada no repositório nem compartilhada em
+mensagens.
 
 Clone o repositório privado dentro do disco Linux (autentique com sua conta,
 sem gravar token na URL), selecionando staging:
